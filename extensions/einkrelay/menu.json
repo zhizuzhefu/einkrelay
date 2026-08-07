@@ -1,0 +1,6 @@
+{
+	"items": [
+		{"name": "EInkRelay: 启动", "priority": 1, "action": "bin/start.sh"},
+		{"name": "EInkRelay: 停止并恢复界面", "priority": 2, "action": "bin/stop.sh"}
+	]
+}

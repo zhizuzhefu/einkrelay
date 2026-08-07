@@ -1,0 +1,382 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: EInkRelay API
+  version: 0.1.0
+  description: >-
+    Frozen v0.1 device-local synchronous API. Slow or incomplete HTTP headers are
+    rejected by the server read deadlines before application JSON can be emitted;
+    the documented 408 response applies to body-read timeouts after routing.
+  license:
+    name: Apache License 2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://{address}:{port}
+    variables:
+      address:
+        default: 0.0.0.0
+      port:
+        default: '8080'
+x-einkrelay-defaults:
+  listenAddress: 0.0.0.0
+  listenPort: 8080
+  imageMaxBytes: 10485760
+  markdownMaxBytes: 1048576
+  maxImageDimension: 8192
+  maxImagePixels: 32000000
+  readHeaderTimeoutSeconds: 15
+  readTimeoutSeconds: 15
+  displayTransactionTimeoutSeconds: 60
+x-error-priority:
+  - Authentication is evaluated first for every /v1 path.
+  - An authenticated display request attempts the shared display lock before validation or body reads.
+  - The resulting priority is 401, then 409, then request-validation errors.
+security:
+  - bearerAuth: []
+paths:
+  /v1/status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          $ref: '#/components/responses/Status'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/display/image:
+    put:
+      operationId: putDisplayImage
+      description: >-
+        Synchronously validates and displays an image. fit defaults to contain.
+        An authenticated request that cannot immediately acquire the shared display
+        lock returns 409 without reading its body.
+      parameters:
+        - name: fit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [contain, cover]
+            default: contain
+      requestBody:
+        required: true
+        content:
+          image/png:
+            schema:
+              type: string
+              contentMediaType: image/png
+              contentEncoding: binary
+          image/jpeg:
+            schema:
+              type: string
+              contentMediaType: image/jpeg
+              contentEncoding: binary
+      responses:
+        '200':
+          $ref: '#/components/responses/Status'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '409':
+          $ref: '#/components/responses/DisplayBusy'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '504':
+          $ref: '#/components/responses/TransactionTimeout'
+  /v1/display/markdown:
+    put:
+      operationId: putDisplayMarkdown
+      description: >-
+        Synchronously displays UTF-8 Markdown. Only an absent charset or charset=utf-8
+        is accepted. Content-Encoding must be absent or identity.
+        The optional font_size query parameter sets the body size in points and
+        scales the whole typographic style proportionally; absent means the
+        default 18-point style.
+      parameters:
+        - name: font_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 12
+            maximum: 72
+            default: 18
+      requestBody:
+        required: true
+        content:
+          text/markdown:
+            schema:
+              type: string
+              contentMediaType: text/markdown
+      responses:
+        '200':
+          $ref: '#/components/responses/Status'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/RequestTimeout'
+        '409':
+          $ref: '#/components/responses/DisplayBusy'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '504':
+          $ref: '#/components/responses/TransactionTimeout'
+  /v1/system/exit:
+    post:
+      operationId: postSystemExit
+      description: Idempotently leaves exclusive mode. A non-empty body is rejected.
+      responses:
+        '200':
+          description: Native UI is active and the returned status has active=false.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  schemas:
+    Status:
+      type: object
+      additionalProperties: false
+      required: [version, active, mode, busy, screen, current, backend, last_error]
+      properties:
+        version:
+          type: string
+          minLength: 1
+        active:
+          type: boolean
+        mode:
+          type: string
+          enum: [active, inactive]
+          description: Derived from active; it is never independently persisted.
+        busy:
+          type: boolean
+        screen:
+          description: >-
+            The visible panel geometry, read from the framebuffer at request
+            time. It is what a caller has to size content against; without it
+            the only way to fit an image is to know the device model. Null when
+            the geometry could not be probed, which is also why every display
+            request would be failing at that moment.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ScreenSize'
+        current:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CurrentDisplay'
+        backend:
+          $ref: '#/components/schemas/BackendStatus'
+        last_error:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/SafeError'
+      allOf:
+        - if:
+            properties:
+              active:
+                const: true
+          then:
+            properties:
+              mode:
+                const: active
+          else:
+            properties:
+              mode:
+                const: inactive
+    ScreenSize:
+      type: object
+      additionalProperties: false
+      required: [width, height]
+      properties:
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+    CurrentDisplay:
+      type: object
+      additionalProperties: false
+      required: [sha256, displayed_at]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        displayed_at:
+          type: string
+          format: date-time
+    BackendStatus:
+      type: object
+      additionalProperties: false
+      required: [name, state, version]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        state:
+          type: string
+          enum: [ready, unavailable, error]
+        version:
+          type: [string, 'null']
+    SafeError:
+      type: object
+      additionalProperties: false
+      required: [code, message, at]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+          description: Stable sanitized text; never contains tokens, paths, command output, or request content.
+        at:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+              minLength: 1
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - invalid_parameter
+        - invalid_encoding
+        - unauthorized
+        - not_found
+        - method_not_allowed
+        - request_timeout
+        - display_busy
+        - payload_too_large
+        - image_dimensions_exceeded
+        - unsupported_media_type
+        - unsupported_content_encoding
+        - decode_failed
+        - render_failed
+        - display_failed
+        - persistence_failed
+        - lifecycle_failed
+        - internal_error
+        - transaction_timeout
+  responses:
+    Status:
+      description: Current committed service status.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Status'
+    BadRequest:
+      description: Invalid request parameters, body, or UTF-8 encoding.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing, malformed, duplicated, or incorrect Bearer credential.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          description: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Authenticated request for an unknown resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    MethodNotAllowed:
+      description: Method is not supported for the resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RequestTimeout:
+      description: Body reading timed out after the request entered the handler.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    DisplayBusy:
+      description: The single display transaction lock was not immediately available.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PayloadTooLarge:
+      description: Request bytes or declared image dimensions exceed configured limits.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnsupportedMediaType:
+      description: Media type or content encoding is unsupported.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableContent:
+      description: Decoding or rendering failed without changing the committed display.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Display, persistence, lifecycle, or internal operation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TransactionTimeout:
+      description: The synchronous display transaction exceeded its total deadline and was canceled before the lock was released.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

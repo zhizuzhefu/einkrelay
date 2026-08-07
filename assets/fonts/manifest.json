@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "fonts": [
+    {
+      "role": "regular",
+      "family": "Noto Sans CJK SC",
+      "style": "Regular",
+      "version": "Sans2.004",
+      "file": "NotoSansCJKsc-Regular.otf",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+      "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+      "bytes": 16437364,
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/LICENSE"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+# The locally built executable. Release artefacts are produced by the
+# reproducible ARMv7 build and are never committed.
+/eink-relay
+/eink-relay-*
+
+# Locally built example binaries.
+/examples/quota-dashboard/quota-dashboard
+
+# Release output directory. scripts/release-build.sh refuses the repository root
+# and demands `git check-ignore` proof for any in-tree path; keeping dist/
+# ignored is what makes the convenient in-tree choice a legal one.
+/dist/
+
+# Local scratch and editor drafts. Never part of the delivered tree.
+/.builder-*
+
+# Font binaries are runtime assets, not source. They are pinned by
+# assets/fonts/manifest.json and installed on the device by
+# `eink-relay fonts ensure`, which verifies the pinned SHA-256 before use.
+*.otf
+*.ttf
+*.ttc
