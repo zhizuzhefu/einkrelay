@@ -6,7 +6,7 @@
 //	Claude      Keychain「Claude Code-credentials」→ api.anthropic.com/api/oauth/usage
 //	Codex       ~/.codex/auth.json                → chatgpt.com/backend-api/wham/usage
 //	Grok        ~/.grok/auth.json                 → cli-chat-proxy.grok.com/v1/billing
-//	Kimi        ~/.kimi-code/credentials/…        → api.kimi.com/coding/v1/usages
+//	Kimi        环境变量 KIMI_API_KEY              → api.kimi.com/coding/v1/usages
 //	GLM         环境变量 ZHIPUAI_API_KEY           → open.bigmodel.cn/api/monitor/usage/quota/limit
 //	MiniMax     环境变量 MINIMAX_API_KEY           → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
 //	Antigravity Keychain service「gemini」account「antigravity」→ daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
@@ -358,16 +358,9 @@ func probeGrok(ctx context.Context) ServiceUsage {
 
 func probeKimi(ctx context.Context) ServiceUsage {
 	s := ServiceUsage{Name: "Kimi"}
-	raw, err := os.ReadFile(homePath(".kimi-code", "credentials", "kimi-code.json"))
-	if err != nil {
-		s.Err = errors.New("~/.kimi-code/credentials/kimi-code.json 不可读")
-		return s
-	}
-	var creds struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(raw, &creds); err != nil || creds.AccessToken == "" {
-		s.Err = errors.New("无法解析 Kimi 凭据")
+	apiKey := os.Getenv("KIMI_API_KEY")
+	if apiKey == "" {
+		s.Err = errors.New("未设置 KIMI_API_KEY")
 		return s
 	}
 	var resp struct {
@@ -389,8 +382,8 @@ func probeKimi(ctx context.Context) ServiceUsage {
 			} `json:"detail"`
 		} `json:"limits"`
 	}
-	err = getJSON(ctx, "https://api.kimi.com/coding/v1/usages", map[string]string{
-		"Authorization": "Bearer " + creds.AccessToken,
+	err := getJSON(ctx, "https://api.kimi.com/coding/v1/usages", map[string]string{
+		"Authorization": "Bearer " + apiKey,
 	}, &resp)
 	if err != nil {
 		s.Err = err
@@ -555,37 +548,11 @@ func probeMiniMax(ctx context.Context) ServiceUsage {
 
 // ─── Antigravity（agy CLI / Gemini）────────────────────────────────────────
 
-// Antigravity 用的是「installed app」OAuth client，其 client id/secret 嵌在
-// 每个用户本机的 agy 二进制里（与 opencode 等第三方集成分享同一对）。
-// 本程序不落盘这对值——代码库里放字符串会被 GitHub push protection 拦截——
-// 而是需要刷新 token 时从本机 agy 二进制里现找。
 const antigravityAPI = "https://daily-cloudcode-pa.googleapis.com/v1internal"
-
-var (
-	googleClientIDPattern     = regexp.MustCompile(`[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com`)
-	// Google client secret 是「GOCSPX-」+ 固定 28 个字符；不定长匹配会把二进制里
-	// 相邻的两个 secret 吞成一个。
-	googleClientSecretPattern = regexp.MustCompile(`GOCSPX-[a-zA-Z0-9_-]{28}`)
-)
-
-// antigravityClientCreds 从本机 agy 二进制提取 OAuth client id 与 secret 列表。
-func antigravityClientCreds() ([]string, []string) {
-	path, err := exec.LookPath("agy")
-	if err != nil {
-		path = homePath(".local", "bin", "agy")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil
-	}
-	ids := googleClientIDPattern.FindAllString(string(data), -1)
-	secrets := googleClientSecretPattern.FindAllString(string(data), -1)
-	return ids, secrets
-}
 
 // antigravityToken 从 macOS Keychain 取 agy CLI 保存的 OAuth token
 //（service「gemini」、account「antigravity」，go-keyring 的 base64 包装）。
-// token 过期时用 refresh_token 换新；不回写 Keychain，本程序只读。
+// 本程序只读凭据，不刷新、不回写；token 过期时请运行一次 agy 让它自己续期。
 func antigravityToken() (string, string, error) {
 	if runtime.GOOS != "darwin" {
 		return "", "", errors.New("Antigravity 凭据读取仅支持 macOS Keychain")
@@ -604,49 +571,18 @@ func antigravityToken() (string, string, error) {
 	}
 	var stored struct {
 		Token struct {
-			AccessToken  string    `json:"access_token"`
-			RefreshToken string    `json:"refresh_token"`
-			Expiry       time.Time `json:"expiry"`
+			AccessToken string    `json:"access_token"`
+			Expiry      time.Time `json:"expiry"`
 		} `json:"token"`
 		AuthMethod string `json:"auth_method"`
 	}
 	if err := json.Unmarshal(decoded, &stored); err != nil || stored.Token.AccessToken == "" {
 		return "", "", errors.New("无法解析 agy 凭据")
 	}
-	if time.Until(stored.Token.Expiry) > time.Minute || stored.Token.RefreshToken == "" {
-		return stored.Token.AccessToken, stored.AuthMethod, nil
+	if time.Until(stored.Token.Expiry) <= time.Minute {
+		return "", "", errors.New("agy token 已过期；请先运行一次 agy 让它刷新凭据")
 	}
-	// 过期且有 refresh_token：用二进制里的 client id/secret 组合逐个尝试刷新
-	//（二进制里有多对，只有一对与 refresh_token 匹配）。新 token 只在内存里用。
-	ids, secrets := antigravityClientCreds()
-	for _, id := range ids {
-		for _, secret := range secrets {
-			form := "client_id=" + id + "&client_secret=" + secret +
-				"&grant_type=refresh_token&refresh_token=" + stored.Token.RefreshToken
-			req, err := http.NewRequest(http.MethodPost, "https://oauth2.googleapis.com/token",
-				strings.NewReader(form))
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			resp, err := (&http.Client{Timeout: httpTimeout}).Do(req)
-			if err != nil {
-				continue
-			}
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				continue
-			}
-			var refreshed struct {
-				AccessToken string `json:"access_token"`
-			}
-			if err := json.Unmarshal(body, &refreshed); err == nil && refreshed.AccessToken != "" {
-				return refreshed.AccessToken, stored.AuthMethod, nil
-			}
-		}
-	}
-	return "", "", errors.New("agy token 已过期且刷新失败；请先运行一次 agy 让 CLI 刷新凭据")
+	return stored.Token.AccessToken, stored.AuthMethod, nil
 }
 
 func probeAntigravity(ctx context.Context) ServiceUsage {
