@@ -51,18 +51,19 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/markdown; c
 | --- | --- | --- | --- |
 | Claude | macOS Keychain「Claude Code-credentials」（Linux 回退 `~/.claude/.credentials.json`） | `api.anthropic.com/api/oauth/usage` | 5 小时 / 本周 |
 | Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` | 按订阅周期 |
-| Grok | `~/.grok/auth.json` | `cli-chat-proxy.grok.com/v1/billing` | 本月（credits） |
+| Grok | `~/.grok/auth.json` | `cli-chat-proxy.grok.com/v1/billing?format=credits`（周/月额度池，与 CLI `/usage` 同源）+ `/v1/billing`（月度 API credits） | 本周（统一计费）/ 本月（API credits） |
 | Kimi | `~/.kimi-code/credentials/kimi-code.json` | `api.kimi.com/coding/v1/usages` | 5 小时 / 本周 |
 | GLM | 环境变量 `ZHIPUAI_API_KEY` | `open.bigmodel.cn/api/monitor/usage/quota/limit` | 5 小时 / 本周 |
 | MiniMax | 环境变量 `MINIMAX_API_KEY` | `api.minimaxi.com/v1/api/openplatform/coding_plan/remains` | 5 小时 / 本周 |
 | Antigravity | macOS Keychain（service「gemini」/ account「antigravity」，agy CLI 写入） | `daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` | 按模型族，各自带重置时间 |
-| DeepSeek | 环境变量 `DEEPSEEK_API_KEY` | `api.deepseek.com/user/balance` | 无窗口；余额 ≥ ¥10 显示 100%，否则 0% |
+| DeepSeek | 环境变量 `DEEPSEEK_API_KEY` | `api.deepseek.com/user/balance` | 无窗口；以 ¥1000 为满额基准换算已用/可用% |
 
 注意各家口径不同：
 
-- Claude / GLM / Kimi 返回「已用百分比」，MiniMax 返回「剩余百分比」（程序换算成已用），Grok 返回月度 credits 的已用/总额。面板一律统一成「已用百分比 + 重置倒计时」展示。
-- **绝对量（已用/总额）只有部分服务提供**：Grok（credits）、Kimi、GLM（额度点数）会返回，直接并进条后文字（如「已用 53% · 53/100」）；MiniMax 只在返回调用计数时显示（其 Coding Plan 常返回 0，此时只有百分比）；Claude、Codex、Antigravity 服务端只给百分比——这几家没有绝对量不是程序没做，是上游没有数据。
-- DeepSeek 是按量账户，没有窗口与重置概念，面板上也**不显示具体金额**：余额 ≥ ¥10 显示「可用 100%」（充足），否则「可用 0%」（该充值了），阈值是 `deepSeekBalanceOKThreshold`。
+- Claude / GLM / Kimi 返回「已用百分比」，MiniMax 返回「剩余百分比」（程序换算成已用），Grok 统一计费用户返回周额度池百分比（`creditUsagePercent`），另附月度 API credits 的已用/总额。面板一律统一成「已用百分比 + 重置倒计时」展示。
+- **Grok 的坑**：裸 `/v1/billing` 只给月度 API credits，对 SuperGrok / X Premium+ 等统一计费用户**不是**限制 Build 的那条额度；真正的周额度池在 `?format=credits`（与 Grok CLI `/usage` 同源，`currentPeriod.type=USAGE_PERIOD_TYPE_WEEKLY`）。程序两路都查，周额度池优先展示。
+- **绝对量（已用/总额）只有部分服务提供**：Grok 月度 API credits、Kimi、GLM（额度点数）会返回，直接并进条后文字（如「已用 53% · 53/100」）；Grok 周额度池、MiniMax（多数情况）、Claude、Codex、Antigravity 服务端只给百分比——没有绝对量不是程序没做，是上游没有数据。
+- DeepSeek 是按量账户，没有窗口与重置概念，面板上也**不显示具体金额**：以 `deepSeekBalanceFull`（默认 ¥1000）为满额基准线性换算——余额 ≥ ¥1000 显示「已用 0% · 可用 100%」；余额 ¥900 显示「已用 10% · 可用 90%」；余额 0 显示「已用 100% · 可用 0%」。进度条与其它服务一致按「已用」填充。
 - **嵌套额度的展示规则**：5 小时 ⊂ 本周 ⊂ 本月。短周期的实际可用额度受所有更长周期约束——周额度用尽时，5 小时窗口即便自己的计数为零也照样不可用。因此短周期行的展示值取 `max(自身已用%, 更长周期已用%)`，被覆盖的行标注「受本周/本月额度限制」，自身重置时间与原始计数不再展示（能否使用取决于长周期，其数值见对应长周期行）。
 - Antigravity 的额度挂在**每个模型**上（`quotaInfo.remainingFraction`），同一模型的高/中/低推理档共享一族额度：程序按展示名聚合成模型族，然后**只展示最新模型的那一族**，与其他厂商的单一额度口径保持一致；其重置点实测固定在约 5 小时周期的边界上，因此行标签是「5小时」，模型名显示在厂商标题行。agy 的 access_token 过期时程序会用 Keychain 里的 refresh_token 现场换新（只在内存使用，不回写）；刷新所需的 OAuth client id/secret 是 Antigravity 分发给每个用户的 installed-app 凭据，程序从本机 agy 二进制里现找，不落盘在代码库中。
 - 一个实测到的坑：Antigravity 的 `v1internal` 端点对不带 `User-Agent` / `X-Goog-Api-Client` 的请求一律回 429，程序已带上。

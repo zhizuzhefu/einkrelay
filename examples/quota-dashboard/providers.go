@@ -5,7 +5,7 @@
 //
 //	Claude      Keychain「Claude Code-credentials」→ api.anthropic.com/api/oauth/usage
 //	Codex       ~/.codex/auth.json                → chatgpt.com/backend-api/wham/usage
-//	Grok        ~/.grok/auth.json                 → cli-chat-proxy.grok.com/v1/billing
+//	Grok        ~/.grok/auth.json                 → cli-chat-proxy.grok.com/v1/billing?format=credits（周/月额度池）+ /v1/billing（月度 API credits）
 //	Kimi        环境变量 KIMI_API_KEY              → api.kimi.com/coding/v1/usages
 //	GLM         环境变量 ZHIPUAI_API_KEY           → open.bigmodel.cn/api/monitor/usage/quota/limit
 //	MiniMax     环境变量 MINIMAX_API_KEY           → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
@@ -296,6 +296,12 @@ func probeCodex(ctx context.Context) ServiceUsage {
 
 // ─── Grok ─────────────────────────────────────────────────────────────────
 
+// probeGrok 读取 Grok CLI 同源的 billing 接口。
+//
+// 注意：无 query 的 /v1/billing 只返回月度 API credits（monthlyLimit/used），
+// 对 SuperGrok / X Premium+ 等统一计费用户并不是真正限制 Build 的额度。
+// Grok CLI 的 /usage 用的是 ?format=credits，返回 creditUsagePercent +
+// currentPeriod（USAGE_PERIOD_TYPE_WEEKLY / MONTHLY）。两者都要查。
 func probeGrok(ctx context.Context) ServiceUsage {
 	s := ServiceUsage{Name: "Grok"}
 	raw, err := os.ReadFile(homePath(".grok", "auth.json"))
@@ -321,36 +327,121 @@ func probeGrok(ctx context.Context) ServiceUsage {
 		s.Err = errors.New("~/.grok/auth.json 中没有 auth.x.ai 凭据")
 		return s
 	}
-	var resp struct {
+	auth := map[string]string{"Authorization": "Bearer " + key}
+
+	// 1) format=credits：CLI 同源的周/月额度池（统一计费用户以周为主）
+	var credits struct {
 		Config struct {
+			CreditUsagePercent *float64 `json:"creditUsagePercent"`
+			CurrentPeriod      *struct {
+				Type  string `json:"type"`
+				Start string `json:"start"`
+				End   string `json:"end"`
+			} `json:"currentPeriod"`
 			MonthlyLimit struct {
 				Val float64 `json:"val"`
 			} `json:"monthlyLimit"`
 			Used struct {
 				Val float64 `json:"val"`
 			} `json:"used"`
-			BillingPeriodEnd string `json:"billingPeriodEnd"`
+			BillingPeriodEnd     string `json:"billingPeriodEnd"`
+			IsUnifiedBillingUser bool   `json:"isUnifiedBillingUser"`
 		} `json:"config"`
+		SubscriptionTier string `json:"subscriptionTier"`
 	}
-	err = getJSON(ctx, "https://cli-chat-proxy.grok.com/v1/billing", map[string]string{
-		"Authorization": "Bearer " + key,
-	}, &resp)
-	if err != nil {
+	if err := getJSON(ctx, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", auth, &credits); err != nil {
 		s.Err = err
 		return s
 	}
-	used := -1.0
-	if resp.Config.MonthlyLimit.Val > 0 {
-		used = resp.Config.Used.Val / resp.Config.MonthlyLimit.Val * 100
-		s.Plan = fmt.Sprintf("%.0f/%.0f credits", resp.Config.Used.Val, resp.Config.MonthlyLimit.Val)
+	if credits.SubscriptionTier != "" {
+		s.Plan = credits.SubscriptionTier
 	}
-	s.Windows = []Window{{
-		Label:       "本月",
-		UsedPercent: used,
-		ResetAt:     parseResetTime(resp.Config.BillingPeriodEnd),
-		Used:        resp.Config.Used.Val,
-		Total:       resp.Config.MonthlyLimit.Val,
-	}}
+
+	if credits.Config.CreditUsagePercent != nil || credits.Config.CurrentPeriod != nil {
+		label := "本周"
+		resetAt := parseResetTime(credits.Config.BillingPeriodEnd)
+		if p := credits.Config.CurrentPeriod; p != nil {
+			switch {
+			case strings.Contains(p.Type, "MONTHLY"):
+				label = "本月"
+			case strings.Contains(p.Type, "WEEKLY"):
+				label = "本周"
+			}
+			if t := parseResetTime(p.End); !t.IsZero() {
+				resetAt = t
+			}
+		} else if !credits.Config.IsUnifiedBillingUser {
+			label = "本月"
+		}
+		used := -1.0
+		if credits.Config.CreditUsagePercent != nil {
+			used = *credits.Config.CreditUsagePercent
+		}
+		s.Windows = append(s.Windows, Window{
+			Label:       label,
+			UsedPercent: used,
+			ResetAt:     resetAt,
+		})
+	}
+
+	// 2) 月度 API credits：format=credits 若已带 monthlyLimit 则复用，否则再查裸端点
+	monthLimit := credits.Config.MonthlyLimit.Val
+	monthUsed := credits.Config.Used.Val
+	monthEnd := credits.Config.BillingPeriodEnd
+	if monthLimit <= 0 {
+		var monthly struct {
+			Config struct {
+				MonthlyLimit struct {
+					Val float64 `json:"val"`
+				} `json:"monthlyLimit"`
+				Used struct {
+					Val float64 `json:"val"`
+				} `json:"used"`
+				BillingPeriodEnd string `json:"billingPeriodEnd"`
+			} `json:"config"`
+		}
+		if err := getJSON(ctx, "https://cli-chat-proxy.grok.com/v1/billing", auth, &monthly); err == nil {
+			monthLimit = monthly.Config.MonthlyLimit.Val
+			monthUsed = monthly.Config.Used.Val
+			monthEnd = monthly.Config.BillingPeriodEnd
+		}
+	}
+	if monthLimit > 0 {
+		pct := monthUsed / monthLimit * 100
+		enriched := false
+		for i := range s.Windows {
+			if s.Windows[i].Label != "本月" {
+				continue
+			}
+			// 同一「本月」行补上绝对量；百分比以额度池为准（若已有）
+			s.Windows[i].Used = monthUsed
+			s.Windows[i].Total = monthLimit
+			if s.Windows[i].UsedPercent < 0 {
+				s.Windows[i].UsedPercent = pct
+			}
+			if s.Windows[i].ResetAt.IsZero() {
+				s.Windows[i].ResetAt = parseResetTime(monthEnd)
+			}
+			enriched = true
+			break
+		}
+		if !enriched {
+			s.Windows = append(s.Windows, Window{
+				Label:       "本月",
+				UsedPercent: pct,
+				ResetAt:     parseResetTime(monthEnd),
+				Used:        monthUsed,
+				Total:       monthLimit,
+			})
+		}
+		if s.Plan == "" {
+			s.Plan = fmt.Sprintf("%.0f/%.0f credits", monthUsed, monthLimit)
+		}
+	}
+
+	if len(s.Windows) == 0 {
+		s.Err = errors.New("billing 响应中没有可用额度")
+	}
 	return s
 }
 
@@ -673,9 +764,10 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 
 // ─── DeepSeek ─────────────────────────────────────────────────────────────
 
-// deepSeekBalanceOKThreshold 是「余额是否充足」的判定线（元）。
-// 面板不展示具体余额，只按这条线显示 100% / 0%。
-const deepSeekBalanceOKThreshold = 10.0
+// deepSeekBalanceFull 是按量余额换算百分比时的满额基准（元）。
+// 余额 ≥ 此值视为可用 100% / 已用 0%；更低时按比例换算，例如
+// 剩余 900 → 已用 10% · 可用 90%。面板不展示具体金额。
+const deepSeekBalanceFull = 1000.0
 
 func probeDeepSeek(ctx context.Context) ServiceUsage {
 	s := ServiceUsage{Name: "DeepSeek"}
@@ -706,18 +798,22 @@ func probeDeepSeek(ctx context.Context) ServiceUsage {
 		s.Err = errors.New("无法解析余额")
 		return s
 	}
-	s.Plan = "按量付费"
-	// 按量账户没有窗口和重置概念，也不展示具体金额：
-	// 余额 >= 阈值显示「可用 100%」（充足），否则「可用 0%」（该充值了）。
-	// 这里的百分比是「可用」语义，用 Note 覆盖默认的「已用」前缀。
-	pct := 0.0
-	if balance >= deepSeekBalanceOKThreshold {
-		pct = 100
+	if balance < 0 {
+		balance = 0
 	}
+	s.Plan = "按量付费"
+	// 按量账户没有窗口和重置：以 deepSeekBalanceFull 为满额基准做线性换算。
+	// 进度条与其它服务一致按「已用」填充；文案同时给出已用/可用百分比。
+	avail := balance
+	if avail > deepSeekBalanceFull {
+		avail = deepSeekBalanceFull
+	}
+	usedPct := (deepSeekBalanceFull - avail) / deepSeekBalanceFull * 100
+	availPct := avail / deepSeekBalanceFull * 100
 	s.Windows = []Window{{
 		Label:       "余额",
-		UsedPercent: pct,
-		Note:        fmt.Sprintf("可用 %.0f%%", pct),
+		UsedPercent: usedPct,
+		Note:        fmt.Sprintf("已用 %.0f%% · 可用 %.0f%%", usedPct, availPct),
 	}}
 	return s
 }
