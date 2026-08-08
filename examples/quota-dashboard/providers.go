@@ -831,9 +831,9 @@ func periodRank(label string) int {
 }
 
 // applyQuotaHierarchy 处理嵌套额度：5 小时 ⊂ 本周 ⊂ 本月。
-// 短周期的实际可用额度受所有更长周期约束——任一长周期用尽，
-// 短周期即便自己的窗口计数为零也同样不可用。因此短周期的展示值取
-// max(自身已用%, 所有更长周期已用%)，被覆盖时记 ConstrainedBy 供界面标注。
+// 各周期窗口相互独立，平时各自展示自身的已用百分比；只有当某个更长
+// 周期已经用尽（100%）时，短周期才同样不可用——此时把短周期也显示为
+// 100%，并记 ConstrainedBy 供界面标注限制来源。
 func applyQuotaHierarchy(s *ServiceUsage) {
 	for i := range s.Windows {
 		wi := &s.Windows[i]
@@ -846,8 +846,8 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 			if j == i || wj.UsedPercent < 0 || periodRank(wj.Label) <= ri {
 				continue
 			}
-			if wj.UsedPercent > wi.UsedPercent {
-				wi.UsedPercent = wj.UsedPercent
+			if wj.UsedPercent >= 100 {
+				wi.UsedPercent = 100
 				wi.ConstrainedBy = wj.Label
 			}
 		}
