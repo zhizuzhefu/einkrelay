@@ -859,7 +859,7 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 func probeAll(ctx context.Context) []ServiceUsage {
 	probes := []func(context.Context) ServiceUsage{
 		probeClaude, probeCodex, probeGrok, probeKimi, probeGLM, probeMiniMax,
-		probeAntigravity, probeDeepSeek,
+		probeDeepSeek, probeAntigravity,
 	}
 	results := make([]ServiceUsage, len(probes))
 	var wg sync.WaitGroup
