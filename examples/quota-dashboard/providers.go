@@ -1,4 +1,4 @@
-// Command quota-dashboard 汇总本机八家 AI 编程服务的额度使用情况，
+// Command quota-dashboard 汇总本机九家 AI 编程服务的额度使用情况，
 // 渲染成一张适合电子墨水屏的灰度 PNG，并推送给 EInkRelay。
 //
 // 数据源（全部在本机实测可用）：
@@ -11,12 +11,15 @@
 //	MiniMax     环境变量 MINIMAX_API_KEY           → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
 //	Antigravity Keychain service「gemini」account「antigravity」→ daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
 //	DeepSeek    环境变量 DEEPSEEK_API_KEY          → api.deepseek.com/user/balance
+//	Bailian     环境变量 BAILIAN_API_KEY（开关）+ ~/.bailian/config.json 的控制台
+//	            access_token（bl auth login --console 写入）→ bailian-cs.console.aliyun.com
+//	            控制台网关 queryFreeTierQuota（模型域 API key 查不到额度）
 //
 // 用法：
 //
 //	DASHBOARD_FONT=/path/to/NotoSansCJKsc-Regular.otf \
 //	EINKRELAY_HOST=192.168.15.244:8080 EINKRELAY_TOKEN=... \
-//	go run .                # 查询八家额度 → 渲染 → 推送到 Kindle
+//	go run .                # 查询九家额度 → 渲染 → 推送到 Kindle
 //
 //	go run . -o out.png     # 只渲染到本地文件，不推送
 package main
@@ -29,11 +32,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -220,10 +225,10 @@ func probeClaude(ctx context.Context) ServiceUsage {
 		} `json:"seven_day"`
 	}
 	err = getJSON(ctx, "https://api.anthropic.com/api/oauth/usage", map[string]string{
-		"Authorization":   "Bearer " + token,
-		"anthropic-beta":  "oauth-2025-04-20",
-		"accept":          "application/json",
-		"user-agent":      "quota-dashboard",
+		"Authorization":  "Bearer " + token,
+		"anthropic-beta": "oauth-2025-04-20",
+		"accept":         "application/json",
+		"user-agent":     "quota-dashboard",
 	}, &resp)
 	if err != nil {
 		s.Err = err
@@ -642,7 +647,7 @@ func probeMiniMax(ctx context.Context) ServiceUsage {
 const antigravityAPI = "https://daily-cloudcode-pa.googleapis.com/v1internal"
 
 // antigravityToken 从 macOS Keychain 取 agy CLI 保存的 OAuth token
-//（service「gemini」、account「antigravity」，go-keyring 的 base64 包装）。
+// （service「gemini」、account「antigravity」，go-keyring 的 base64 包装）。
 // 本程序只读凭据，不刷新、不回写；token 过期时请运行一次 agy 让它自己续期。
 func antigravityToken() (string, string, error) {
 	if runtime.GOOS != "darwin" {
@@ -695,9 +700,9 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 		} `json:"models"`
 	}
 	err = postJSON(ctx, antigravityAPI+":fetchAvailableModels", map[string]string{
-		"Authorization":    "Bearer " + token,
-		"Content-Type":     "application/json",
-		"User-Agent":       "antigravity/1.1.11 darwin/arm64",
+		"Authorization":     "Bearer " + token,
+		"Content-Type":      "application/json",
+		"User-Agent":        "antigravity/1.1.11 darwin/arm64",
 		"X-Goog-Api-Client": "gl-go/1.24 antigravity/1.1.11",
 	}, "{}", &resp)
 	if err != nil {
@@ -818,8 +823,276 @@ func probeDeepSeek(ctx context.Context) ServiceUsage {
 	return s
 }
 
+// ─── Bailian（阿里云百炼）──────────────────────────────────────────────────
+
+// 百炼的额度查不到模型域的接口上：sk- / sk-sp- 这类 API key 只能调模型，
+// 用量端点实测一律 404（/v1/usage、/v1/billing、/api/v1/subscription、
+// /apps/anthropic/api/oauth/usage…），响应头里也没有 credits 信息，官方文档
+// 与社区（one-api 等）同样把 DashScope 列为「余额不可查」。唯一能拿到额度的
+// 是 bl CLI 同源的控制台网关，它只认 `bl auth login --console` 写在
+// ~/.bailian/config.json 里的 access_token。本程序只读该凭据，不刷新、不回写；
+// 过期时重新跑一次 `bl auth login --console`。
+// 网关上有两套额度：Token Plan 订阅额度（付费套餐，控制台「套餐额度」那根条，
+// zeldaHttp 路径代理）和按模型发放的免费额度。面板优先展示订阅额度，没有有效
+// 订阅（按量账户）才退回免费额度。
+const (
+	bailianGateway         = "https://bailian-cs.console.aliyun.com/cli/api.json"
+	bailianFreeTierAPI     = "zeldaEasy.bailian-commerce.freeTrial.queryFreeTierQuota"
+	bailianUsageAPI        = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"
+	bailianSubscriptionAPI = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription"
+	// 额外用量包（加油包）：zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/addon/summary
+	// 返回 totalCredits / remainingCredits。没接进面板——它不受周额度约束，
+	// 混进窗口列表会被 applyQuotaHierarchy 误标成「受本周额度限制」。
+)
+
+// bailianModels 是面板要查的模型。百炼的免费额度按模型单独发放，没有账号级
+// 总额，这里只盯常用的几个，取最紧张的那个上面板（与 Antigravity 同口径）。
+var bailianModels = []string{"qwen3.8-max", "qwen3.7-plus", "qwen3-coder-plus"}
+
+// bailianCreds 是控制台网关要的一套凭据，全部来自 ~/.bailian/config.json。
+type bailianCreds struct {
+	AccessToken   string `json:"access_token"`
+	ConsoleRegion string `json:"console_region"`
+	SwitchAgent   int    `json:"console_switch_agent"` // 主子账号/代运维切换，网关按它定位账号
+}
+
+// bailianConsoleCreds 从 ~/.bailian/config.json 读控制台凭据：优先活跃 profile，
+// 没有再按名字顺序找第一个存了 access_token 的 profile。
+func bailianConsoleCreds() (bailianCreds, error) {
+	raw, err := os.ReadFile(homePath(".bailian", "config.json"))
+	if err != nil {
+		return bailianCreds{}, errors.New("~/.bailian/config.json 不可读")
+	}
+	var file map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return bailianCreds{}, errors.New("无法解析百炼配置")
+	}
+	pick := func(name string) (bailianCreds, bool) {
+		var c bailianCreds
+		if raw, ok := file[name]; ok && json.Unmarshal(raw, &c) == nil && c.AccessToken != "" {
+			return c, true
+		}
+		return bailianCreds{}, false
+	}
+	var active string
+	if raw, ok := file["active_config"]; ok {
+		json.Unmarshal(raw, &active)
+	}
+	creds, ok := pick(active)
+	if !ok {
+		names := make([]string, 0, len(file))
+		for name := range file {
+			if name != "active_config" {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if creds, ok = pick(name); ok {
+				break
+			}
+		}
+	}
+	if !ok {
+		return bailianCreds{}, errors.New("未登录百炼控制台；先跑一次 bl auth login --console")
+	}
+	if creds.ConsoleRegion == "" {
+		creds.ConsoleRegion = "cn-beijing"
+	}
+	return creds, nil
+}
+
+// bailianConsole 调控制台网关。请求体是 form，其中 params 是一段 JSON；
+// cornerstoneParam 是网关必带的路由参数，取值照抄 bl CLI。
+func bailianConsole(ctx context.Context, creds bailianCreds, api string, data map[string]any, out any) error {
+	corner := map[string]any{
+		"protocol":       "V2",
+		"console":        "ONE_CONSOLE",
+		"productCode":    "p_efm",
+		"switchUserType": 3,
+		"consoleSite":    "BAILIAN_ALIYUN",
+	}
+	if creds.SwitchAgent > 0 {
+		corner["switchAgent"] = creds.SwitchAgent
+	}
+	data["cornerstoneParam"] = corner
+	params, err := json.Marshal(map[string]any{"Api": api, "V": "1.0", "Data": data})
+	if err != nil {
+		return err
+	}
+	form := url.Values{"params": {string(params)}, "region": {creds.ConsoleRegion}}
+	endpoint := fmt.Sprintf("%s?action=BroadScopeAspnGateway&product=sfm_bailian&api=%s",
+		bailianGateway, url.QueryEscape(api))
+	return postJSON(ctx, endpoint, map[string]string{
+		"Authorization": "Bearer " + creds.AccessToken,
+		"Content-Type":  "application/x-www-form-urlencoded",
+	}, form.Encode(), out)
+}
+
+// bailianConsoleData 调网关并把业务数据解到 out。网关的壳子分两层：
+// data.DataV2.data 是业务响应（code/msg/success），它里面的 data 才是数据；
+// 老接口没有 DataV2，退回 data.data。两层 success 都要看。
+func bailianConsoleData(ctx context.Context, creds bailianCreds, api string, data map[string]any, out any) error {
+	if data == nil {
+		data = map[string]any{}
+	}
+	var resp struct {
+		Data struct {
+			Success   *bool           `json:"success"`
+			ErrorCode json.RawMessage `json:"errorCode"`
+			Data      json.RawMessage `json:"data"`
+			DataV2    json.RawMessage `json:"DataV2"`
+		} `json:"data"`
+	}
+	if err := bailianConsole(ctx, creds, api, data, &resp); err != nil {
+		return err
+	}
+	if resp.Data.Success != nil && !*resp.Data.Success {
+		code := strings.Trim(string(resp.Data.ErrorCode), `"`)
+		if strings.Contains(code, "NotLogined") {
+			return errors.New("控制台会话已过期；重新跑一次 bl auth login --console")
+		}
+		return errors.New("控制台网关返回 " + code)
+	}
+	payload := resp.Data.Data
+	if len(resp.Data.DataV2) > 0 {
+		var v2 struct {
+			Data struct {
+				Code    string          `json:"code"`
+				Msg     string          `json:"msg"`
+				Status  int             `json:"status"` // 路径代理找不到接口时是 404
+				Success *bool           `json:"success"`
+				Data    json.RawMessage `json:"data"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Data.DataV2, &v2); err != nil {
+			return errors.New("无法解析网关响应")
+		}
+		if v2.Data.Status != 0 && v2.Data.Status != 200 {
+			return fmt.Errorf("接口返回 HTTP %d", v2.Data.Status)
+		}
+		if v2.Data.Success != nil && !*v2.Data.Success {
+			msg := v2.Data.Msg
+			if msg == "" {
+				msg = v2.Data.Code
+			}
+			return errors.New("接口返回 " + msg)
+		}
+		payload = v2.Data.Data
+	}
+	if len(payload) == 0 {
+		return errors.New("响应中没有数据")
+	}
+	return json.Unmarshal(payload, out)
+}
+
+// bailianTokenPlan 查 Token Plan 订阅额度：控制台「套餐额度」显示的就是
+// per1WeekPercentage（0–1 的比例，页面上乘 100 显示），按周重置。
+func bailianTokenPlan(ctx context.Context, creds bailianCreds, s *ServiceUsage) error {
+	var usage struct {
+		Per1WeekPercentage float64 `json:"per1WeekPercentage"`
+		Per1WeekResetTime  int64   `json:"per1WeekResetTime"`
+	}
+	if err := bailianConsoleData(ctx, creds, bailianUsageAPI, nil, &usage); err != nil {
+		return err
+	}
+	if usage.Per1WeekResetTime <= 0 {
+		return errors.New("没有 Token Plan 周额度")
+	}
+	s.Windows = []Window{{
+		Label:       "本周",
+		UsedPercent: usage.Per1WeekPercentage * 100,
+		ResetAt:     epochToTime(usage.Per1WeekResetTime),
+	}}
+	// 套餐档位与剩余天数只是标题行的注解，查不到不影响额度展示。
+	var sub struct {
+		SpecCode      string `json:"specCode"`
+		RemainingDays int    `json:"remainingDays"`
+		Status        string `json:"status"`
+	}
+	if bailianConsoleData(ctx, creds, bailianSubscriptionAPI, nil, &sub) == nil && sub.SpecCode != "" {
+		s.Plan = "Token Plan " + sub.SpecCode
+		if sub.RemainingDays > 0 {
+			s.Plan += fmt.Sprintf(" · 剩余 %d 天", sub.RemainingDays)
+		}
+	}
+	return nil
+}
+
+type bailianQuota struct {
+	Model               string  `json:"model"`
+	QuotaTotal          float64 `json:"quotaTotal"`          // 剩余额度
+	QuotaInitTotal      float64 `json:"quotaInitTotal"`      // 发放总额
+	QuotaValidityPeriod int64   `json:"quotaValidityPeriod"` // 到期时间（毫秒）；0 表示不过期
+}
+
+func probeBailian(ctx context.Context) ServiceUsage {
+	s := ServiceUsage{Name: "Bailian"}
+	// API key 只当开关用（与其它按量服务一致：没配就不在面板上占一格），
+	// 额度本身查不到模型域接口上，得靠下面的控制台凭据。
+	if os.Getenv("BAILIAN_API_KEY") == "" && os.Getenv("DASHSCOPE_API_KEY") == "" {
+		s.Err = errors.New("未设置 BAILIAN_API_KEY")
+		return s
+	}
+	creds, err := bailianConsoleCreds()
+	if err != nil {
+		s.Err = err
+		return s
+	}
+	// 有付费套餐就展示套餐额度；没有（按量账户）再退回按模型的免费额度。
+	if err := bailianTokenPlan(ctx, creds, &s); err == nil {
+		return s
+	}
+	var quotas struct {
+		FreeTierQuotas []bailianQuota `json:"freeTierQuotas"`
+	}
+	err = bailianConsoleData(ctx, creds, bailianFreeTierAPI, map[string]any{
+		"queryFreeTierQuotaRequest": map[string]any{"models": bailianModels},
+	}, &quotas)
+	if err != nil {
+		s.Err = err
+		return s
+	}
+
+	// 免费额度按模型发放且不重置，只有到期：取剩余比例最低（最紧张）的一个，
+	// 模型名与到期日放进 plan 槽位，行标签统一成「免费额度」。
+	now := time.Now()
+	var best *bailianQuota
+	for i := range quotas.FreeTierQuotas {
+		q := &quotas.FreeTierQuotas[i]
+		if q.QuotaInitTotal <= 0 {
+			continue
+		}
+		if q.QuotaValidityPeriod > 0 && epochToTime(q.QuotaValidityPeriod).Before(now) {
+			continue // 已过期
+		}
+		if best == nil || q.QuotaTotal/q.QuotaInitTotal < best.QuotaTotal/best.QuotaInitTotal {
+			best = q
+		}
+	}
+	if best == nil {
+		s.Err = errors.New("免费额度已过期或未发放")
+		return s
+	}
+	s.Plan = best.Model
+	if expiry := epochToTime(best.QuotaValidityPeriod); !expiry.IsZero() {
+		s.Plan += " · " + expiry.Local().Format("01-02") + " 到期"
+	}
+	used := best.QuotaInitTotal - best.QuotaTotal
+	if used < 0 {
+		used = 0
+	}
+	s.Windows = []Window{{
+		Label:       "免费额度",
+		UsedPercent: used / best.QuotaInitTotal * 100,
+		Used:        used,
+		Total:       best.QuotaInitTotal,
+	}}
+	return s
+}
+
 // periodRank 给窗口排层级：短周期在前。无法识别的标签按 0 处理
-//（同层不互相覆盖，例如 Antigravity 的模型族名）。
+// （同层不互相覆盖，例如 Antigravity 的模型族名）。
 func periodRank(label string) int {
 	switch label {
 	case "本周":
@@ -859,7 +1132,7 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 func probeAll(ctx context.Context) []ServiceUsage {
 	probes := []func(context.Context) ServiceUsage{
 		probeClaude, probeCodex, probeGrok, probeKimi, probeGLM, probeMiniMax,
-		probeDeepSeek, probeAntigravity,
+		probeDeepSeek, probeBailian, probeAntigravity,
 	}
 	results := make([]ServiceUsage, len(probes))
 	var wg sync.WaitGroup

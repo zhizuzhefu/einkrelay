@@ -2,7 +2,7 @@
 
 EInkRelay 是 Kindle Paperwhite 4（固件 5.18.1.1.1、ARMv7）上的本地 REST 全屏显示服务。它是纯 Go、`CGO_ENABLED=0` 的单一可执行文件：`guard` 与 `serve` 分别运行在独立进程中，前者监督后者、处理触摸角落退出和原生 UI 恢复。本项目不依赖 KUAL，也不需要 Mac、树莓派或云端常驻程序；USBNetwork 与 Wi-Fi 均访问同一监听器和同一版本化 API。
 
-许可证为 [Apache-2.0](LICENSE)。完整机器可读接口见 [docs/openapi.yaml](docs/openapi.yaml)，日常调用的可执行示例见 [docs/api-examples.md](docs/api-examples.md)，真实场景示例（把本机 Claude / Codex / Grok / Kimi / GLM / MiniMax / Antigravity / DeepSeek 的额度使用情况做成仪表盘推到 Kindle，[examples/quota-dashboard/](examples/quota-dashboard/) 是可运行的纯 Go 程序）见 [docs/dashboard-example.md](docs/dashboard-example.md)，运行参数见 [docs/configuration.md](docs/configuration.md)，第三方声明见 [docs/third-party.md](docs/third-party.md)。
+许可证为 [Apache-2.0](LICENSE)。完整机器可读接口见 [docs/openapi.yaml](docs/openapi.yaml)，日常调用的可执行示例见 [docs/api-examples.md](docs/api-examples.md)，真实场景示例（把本机 Claude / Codex / Grok / Kimi / GLM / MiniMax / Antigravity / DeepSeek / 百炼的额度使用情况做成仪表盘推到 Kindle，[examples/quota-dashboard/](examples/quota-dashboard/) 是可运行的纯 Go 程序）见 [docs/dashboard-example.md](docs/dashboard-example.md)，运行参数见 [docs/configuration.md](docs/configuration.md)，第三方声明见 [docs/third-party.md](docs/third-party.md)。
 
 可复现 release 构建见 [docs/release-build.md](docs/release-build.md)。
 

@@ -9,9 +9,9 @@ import (
 // 文本（Markdown）模式：排版在设备端完成，主机只发一段 Markdown。
 // 约束（真机实测）：无 GFM 表格、粗体/等宽回退比例字体、跨行空格对齐不可靠——
 // 所以进度条用块字符 █/░（同名字宽一致，同行内不涉及跨行对齐），每格 5%。
-// 21pt 下 8 家厂商恰好排满 1072x1448，超出部分设备端按行截断。
+// 20pt 下 9 家厂商恰好排满 1072x1448，超出部分设备端按行截断。
 
-const textFontSize = 21
+const textFontSize = 20
 
 // textBar 渲染 20 格块字符进度条，每格 5%。
 func textBar(pct float64) string {

@@ -197,13 +197,37 @@ func (r *renderer) render(services []ServiceUsage, now time.Time) {
 	r.text(right-r.textWidth(stamp, 26), margin+44, stamp, 26, muted)
 	r.hline(margin, right, margin+78, ink, 3)
 
-	const (
-		blockHead = 40 // 厂商名行高
-		rowHeight = 60 // 每个窗口的进度条行高（绝对量已并入条内文字，无明细行）
-		blockGap  = 12 // 厂商之间的间距（靠留白分组）
-	)
+	blockHead := 40 // 厂商名行高
+	rowHeight := 60 // 每个窗口的进度条行高（绝对量已并入条内文字，无明细行）
+	blockGap := 12  // 厂商之间的间距（靠留白分组）
 
 	y := margin + 148
+
+	// 版式高度自适应：厂商数与各家窗口行数都会变（某家多一个窗口、某家查询
+	// 失败只占一行），固定行距在行数偏多时会把最后一家顶到页脚线以下。这里
+	// 先按内容量把行距压到刚好放得下——行数不多时取值不变，版面照旧。
+	rows := 0
+	for _, s := range services {
+		if s.Err != nil {
+			rows++
+			continue
+		}
+		rows += len(s.Windows)
+	}
+	avail := (h - margin - 52) - y // 页脚横线以上留给内容的高度
+	needed := func() int { return len(services)*(blockHead+blockGap) + rows*rowHeight }
+	for needed() > avail && (rowHeight > 46 || blockHead > 34 || blockGap > 6) {
+		if rowHeight > 46 {
+			rowHeight -= 2
+		}
+		if blockHead > 34 {
+			blockHead--
+		}
+		if blockGap > 6 {
+			blockGap--
+		}
+	}
+
 	for _, s := range services {
 		r.text(margin, y, s.Name, 32, ink)
 		if s.Plan != "" {
