@@ -9,7 +9,7 @@ import (
 // 文本（Markdown）模式：排版在设备端完成，主机只发一段 Markdown。
 // 约束（真机实测）：无 GFM 表格、粗体/等宽回退比例字体、跨行空格对齐不可靠——
 // 所以进度条用块字符 █/░（同名字宽一致，同行内不涉及跨行对齐），每格 5%。
-// 20pt 下 9 家厂商恰好排满 1072x1448，超出部分设备端按行截断。
+// 20pt 下 8 家厂商恰好排满 1072x1448，超出部分设备端按行截断。
 
 const textFontSize = 20
 
@@ -95,7 +95,12 @@ func buildMarkdown(services []ServiceUsage, now time.Time) string {
 			lastService = r.service
 		}
 		if r.pct < 0 {
-			fmt.Fprintf(&b, "\n%s\n", r.tail)
+			if r.label != "" {
+				pad := strings.Repeat("　", maxEm+1-emLen(r.label))
+				fmt.Fprintf(&b, "\n%s%s%s\n", r.label, pad, r.tail)
+			} else {
+				fmt.Fprintf(&b, "\n%s\n", r.tail)
+			}
 			continue
 		}
 		// 标签列补齐到统一 em 宽（再留 1em 间隙）+ 固定 20 格进度条：
