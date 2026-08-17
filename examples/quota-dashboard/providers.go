@@ -709,20 +709,20 @@ const antigravityAPI = "https://daily-cloudcode-pa.googleapis.com/v1internal"
 // antigravityToken 从 macOS Keychain 取 agy CLI 保存的 OAuth token
 // （service「gemini」、account「antigravity」，go-keyring 的 base64 包装）。
 // 本程序只读凭据，不刷新、不回写；token 过期时请运行一次 agy 让它自己续期。
-func antigravityToken() (string, string, error) {
+func antigravityToken() (string, error) {
 	if runtime.GOOS != "darwin" {
-		return "", "", errors.New("Antigravity 凭据读取仅支持 macOS Keychain")
+		return "", errors.New("Antigravity 凭据读取仅支持 macOS Keychain")
 	}
 	out, err := exec.Command("security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w").Output()
 	if err != nil {
-		return "", "", errors.New("Keychain 中没有 agy 凭据（service gemini / account antigravity）")
+		return "", errors.New("Keychain 中没有 agy 凭据（service gemini / account antigravity）")
 	}
 	raw := strings.TrimSpace(string(out))
 	raw = strings.TrimPrefix(raw, "go-keyring-base64:")
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
 		if decoded, err = base64.RawStdEncoding.DecodeString(raw); err != nil {
-			return "", "", errors.New("无法解码 agy 凭据")
+			return "", errors.New("无法解码 agy 凭据")
 		}
 	}
 	var stored struct {
@@ -730,20 +730,47 @@ func antigravityToken() (string, string, error) {
 			AccessToken string    `json:"access_token"`
 			Expiry      time.Time `json:"expiry"`
 		} `json:"token"`
-		AuthMethod string `json:"auth_method"`
 	}
 	if err := json.Unmarshal(decoded, &stored); err != nil || stored.Token.AccessToken == "" {
-		return "", "", errors.New("无法解析 agy 凭据")
+		return "", errors.New("无法解析 agy 凭据")
 	}
 	if time.Until(stored.Token.Expiry) <= time.Minute {
-		return "", "", errors.New("agy token 已过期；请先运行一次 agy 让它刷新凭据")
+		return "", errors.New("agy token 已过期；请先运行一次 agy 让它刷新凭据")
 	}
-	return stored.Token.AccessToken, stored.AuthMethod, nil
+	return stored.Token.AccessToken, nil
+}
+
+// modelVersionRe 匹配模型名中的第一个版本号（如 "Gemini 3.10 Flash" 的 3.10）。
+var modelVersionRe = regexp.MustCompile(`\d+(?:\.\d+)*`)
+
+// versionSegments 把名字中的第一个版本号按段拆成整数；没有版本号时返回 nil。
+func versionSegments(name string) []int {
+	parts := strings.Split(modelVersionRe.FindString(name), ".")
+	segs := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil
+		}
+		segs = append(segs, n)
+	}
+	return segs
+}
+
+// compareVersions 按段比较版本号：3.10 > 3.9（ParseFloat 会把 3.10 当成 3.1）。
+// 前缀相同则段数多的更大；a 大返回正数，相等返回 0。
+func compareVersions(a, b []int) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return len(a) - len(b)
 }
 
 func probeAntigravity(ctx context.Context) ServiceUsage {
 	s := ServiceUsage{Name: "Antigravity"}
-	token, authMethod, err := antigravityToken()
+	token, err := antigravityToken()
 	if err != nil {
 		s.Err = err
 		return s
@@ -772,18 +799,23 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 
 	// 同一模型的高中低推理档共享一族额度：按展示名去掉「(High)」等后缀聚合，
 	// 一族取最紧张（remainingFraction 最小）的那个模型来代表。
+	// 没有展示名的条目（多为尚未正式发布的新模型）用模型 id 去掉档级后缀兜底，
+	// 保证新模型一出现就能参与「最新模型」的竞选。
 	type family struct {
 		used    float64
 		resetAt time.Time
 	}
 	families := map[string]*family{}
-	for _, m := range resp.Models {
-		if m.QuotaInfo == nil || m.DisplayName == "" {
+	for id, m := range resp.Models {
+		if m.QuotaInfo == nil {
 			continue
 		}
 		name := m.DisplayName
 		if i := strings.Index(name, " ("); i > 0 {
 			name = name[:i]
+		}
+		if name == "" {
+			name = strings.TrimSuffix(id, "-tiered")
 		}
 		used := (1 - m.QuotaInfo.RemainingFraction) * 100
 		f, ok := families[name]
@@ -802,14 +834,19 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 	}
 	// 只展示最新模型那一族，和其他厂商的单一额度口径保持一致。
 	// Antigravity 还代理 Claude 等别家模型，这里只取 Gemini 自家模型。
-	verRe := regexp.MustCompile(`\d+(?:\.\d+)*`)
-	best, bestVer := "", -1.0
+	// 版本号按段比较（3.10 > 3.9），不能用 ParseFloat。
+	best := ""
+	var bestVer []int
 	for name, f := range families {
-		if !strings.Contains(name, "Gemini") {
+		if !strings.Contains(strings.ToLower(name), "gemini") {
 			continue
 		}
-		v, _ := strconv.ParseFloat(verRe.FindString(name), 64)
-		if v > bestVer || (v == bestVer && best != "" && f.used > families[best].used) {
+		v := versionSegments(name)
+		if v == nil {
+			continue
+		}
+		if best == "" || compareVersions(v, bestVer) > 0 ||
+			(compareVersions(v, bestVer) == 0 && f.used > families[best].used) {
 			best, bestVer = name, v
 		}
 	}
@@ -821,8 +858,8 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 	}
 	f := families[best]
 	// 与其他厂商的口径统一：行标签是周期而非模型名。该额度的重置点实测
-	// 固定在约 5 小时周期的边界上；模型名放进 plan 槽位展示。
-	s.Plan = authMethod + " · " + best
+	// 固定在约 5 小时周期的边界上；自动选出的最新模型族只用于取额度，
+	// 不展示具体模型名（Plan 留空）。
 	s.Windows = []Window{{Label: "5小时", UsedPercent: f.used, ResetAt: f.resetAt}}
 	return s
 }
