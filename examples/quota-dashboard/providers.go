@@ -1,4 +1,4 @@
-// Command quota-dashboard 汇总本机八家 AI 编程服务的额度使用情况，
+// Command quota-dashboard 汇总本机九家 AI 编程服务的额度使用情况，
 // 渲染成一张适合电子墨水屏的灰度 PNG，并推送给 EInkRelay。
 //
 // 数据源（全部在本机实测可用）：
@@ -10,13 +10,14 @@
 //	GLM         环境变量 ZHIPUAI_API_KEY           → open.bigmodel.cn/api/monitor/usage/quota/limit
 //	MiniMax     环境变量 MINIMAX_API_KEY           → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
 //	Antigravity Keychain service「gemini」account「antigravity」→ daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
+//	Auggie      本机 CLI `auggie account status --json` → 本周期剩余/包含额度
 //	DeepSeek    环境变量 DEEPSEEK_API_KEY          → api.deepseek.com/user/balance
 //
 // 用法：
 //
 //	DASHBOARD_FONT=/path/to/NotoSansCJKsc-Regular.otf \
 //	EINKRELAY_HOST=192.168.15.244:8080 EINKRELAY_TOKEN=... \
-//	go run .                # 查询八家额度 → 渲染 → 推送到 Kindle
+//	go run .                # 查询九家额度 → 渲染 → 推送到 Kindle
 //
 //	go run . -o out.png     # 只渲染到本地文件，不推送
 package main
@@ -28,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -864,6 +866,103 @@ func probeAntigravity(ctx context.Context) ServiceUsage {
 	return s
 }
 
+// auggieStatus 是 auggie account status --json 中面板所需的字段。
+// 其余字段（包括 banner）故意不解析，避免把账户信息带入结果。
+type auggieStatus struct {
+	PlanName               string `json:"planName"`
+	UsageUnit              string `json:"usageUnit"`
+	AmountRemaining        string `json:"amountRemaining"`
+	AmountIncludedPerCycle string `json:"amountIncludedPerCycle"`
+	BillingCycleEndDate    string `json:"billingCycleEndDate"`
+}
+
+func parseAuggieAmount(raw, field string) (float64, error) {
+	n, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0, fmt.Errorf("Auggie %s 不是有效数字", field)
+	}
+	return n, nil
+}
+
+// parseAuggieWindow 解析 Auggie 的字符串额度并计算本周期窗口。
+// Used 保留原始绝对量（即使数据超出边界），只有百分比做 0–100 保护。
+func parseAuggieWindow(status auggieStatus) (Window, error) {
+	remaining, err := parseAuggieAmount(status.AmountRemaining, "amountRemaining")
+	if err != nil {
+		return Window{}, err
+	}
+	included, err := parseAuggieAmount(status.AmountIncludedPerCycle, "amountIncludedPerCycle")
+	if err != nil {
+		return Window{}, err
+	}
+	if included <= 0 {
+		return Window{}, errors.New("Auggie amountIncludedPerCycle 必须大于 0")
+	}
+	used := included - remaining
+	if math.IsInf(used, 0) || math.IsNaN(used) {
+		return Window{}, errors.New("Auggie 额度计算结果超出范围")
+	}
+	pct := used / included * 100
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
+	}
+	return Window{
+		Label:       "本周期",
+		UsedPercent: pct,
+		ResetAt:     parseResetTime(status.BillingCycleEndDate),
+		Used:        used,
+		Total:       included,
+	}, nil
+}
+
+func auggiePlan(planName, usageUnit string) string {
+	plan := strings.TrimSpace(planName)
+	unit := strings.TrimSpace(usageUnit)
+	if plan == "" {
+		return unit
+	}
+	if unit == "" || strings.Contains(strings.ToLower(plan), strings.ToLower(unit)) {
+		return plan
+	}
+	return plan + " · " + unit
+}
+
+func probeAuggie(ctx context.Context) ServiceUsage {
+	s := ServiceUsage{Name: "Auggie"}
+	if err := ctx.Err(); err != nil {
+		s.Err = err
+		return s
+	}
+	out, err := exec.CommandContext(ctx, "auggie", "account", "status", "--json").Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			s.Err = ctxErr
+		} else {
+			s.Err = errors.New("Auggie CLI 不可用或执行失败")
+		}
+		return s
+	}
+	if err := ctx.Err(); err != nil {
+		s.Err = err
+		return s
+	}
+	var status auggieStatus
+	if err := json.Unmarshal(out, &status); err != nil {
+		s.Err = errors.New("无法解析 Auggie 状态 JSON")
+		return s
+	}
+	window, err := parseAuggieWindow(status)
+	if err != nil {
+		s.Err = err
+		return s
+	}
+	s.Plan = auggiePlan(status.PlanName, status.UsageUnit)
+	s.Windows = []Window{window}
+	return s
+}
+
 // ─── DeepSeek ─────────────────────────────────────────────────────────────
 
 // deepSeekBalanceFull 是按量余额换算百分比时的满额基准（元）。
@@ -961,7 +1060,7 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 func probeAll(ctx context.Context) []ServiceUsage {
 	probes := []func(context.Context) ServiceUsage{
 		probeClaude, probeCodex, probeGrok, probeKimi, probeGLM, probeMiniMax,
-		probeDeepSeek, probeAntigravity,
+		probeDeepSeek, probeAntigravity, probeAuggie,
 	}
 	results := make([]ServiceUsage, len(probes))
 	var wg sync.WaitGroup
