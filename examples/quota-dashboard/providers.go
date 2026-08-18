@@ -1,4 +1,4 @@
-// Command quota-dashboard 汇总本机九家 AI 编程服务的额度使用情况，
+// Command quota-dashboard 汇总本机七家 AI 编程服务的额度使用情况，
 // 渲染成一张适合电子墨水屏的灰度 PNG，并推送给 EInkRelay。
 //
 // 数据源（全部在本机实测可用）：
@@ -8,33 +8,30 @@
 //	Grok        ~/.grok/auth.json                 → cli-chat-proxy.grok.com/v1/billing?format=credits（周/月额度池）+ /v1/billing（月度 API credits）；套餐名回退 grok.com/rest/subscriptions
 //	Kimi        环境变量 KIMI_API_KEY              → api.kimi.com/coding/v1/usages
 //	GLM         环境变量 ZHIPUAI_API_KEY           → open.bigmodel.cn/api/monitor/usage/quota/limit
-//	MiniMax     环境变量 MINIMAX_API_KEY           → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
-//	Antigravity Keychain service「gemini」account「antigravity」→ daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
-//	Auggie      本机 CLI `auggie account status --json` → 本周期剩余/包含额度
+//
+// MiniMax     环境变量 MINIMAX_API_KEY          → api.minimaxi.com/v1/api/openplatform/coding_plan/remains
+//
 //	DeepSeek    环境变量 DEEPSEEK_API_KEY          → api.deepseek.com/user/balance
 //
 // 用法：
 //
 //	DASHBOARD_FONT=/path/to/NotoSansCJKsc-Regular.otf \
 //	EINKRELAY_HOST=192.168.15.244:8080 EINKRELAY_TOKEN=... \
-//	go run .                # 查询九家额度 → 渲染 → 推送到 Kindle
+//	go run .                # 查询七家额度 → 渲染 → 推送到 Kindle
 //
 //	go run . -o out.png     # 只渲染到本地文件，不推送
 package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -303,7 +300,7 @@ func probeCodex(ctx context.Context) ServiceUsage {
 // 注意：无 query 的 /v1/billing 只返回月度 API credits（monthlyLimit/used），
 // 对 SuperGrok / X Premium+ 等统一计费用户并不是真正限制 Build 的额度。
 // Grok CLI 的 /usage 用的是 ?format=credits，返回 currentPeriod
-//（USAGE_PERIOD_TYPE_WEEKLY / MONTHLY）和可选的 creditUsagePercent。
+// （USAGE_PERIOD_TYPE_WEEKLY / MONTHLY）和可选的 creditUsagePercent。
 // creditUsagePercent 是 proto3 标量：已用 0% 时字段会被省略，不是「未知」。
 // subscriptionTier 现在经常也不在 billing 里，套餐名回退到 grok.com/rest/subscriptions。
 func probeGrok(ctx context.Context) ServiceUsage {
@@ -704,265 +701,6 @@ func probeMiniMax(ctx context.Context) ServiceUsage {
 	return s
 }
 
-// ─── Antigravity（agy CLI / Gemini）────────────────────────────────────────
-
-const antigravityAPI = "https://daily-cloudcode-pa.googleapis.com/v1internal"
-
-// antigravityToken 从 macOS Keychain 取 agy CLI 保存的 OAuth token
-// （service「gemini」、account「antigravity」，go-keyring 的 base64 包装）。
-// 本程序只读凭据，不刷新、不回写；token 过期时请运行一次 agy 让它自己续期。
-func antigravityToken() (string, error) {
-	if runtime.GOOS != "darwin" {
-		return "", errors.New("Antigravity 凭据读取仅支持 macOS Keychain")
-	}
-	out, err := exec.Command("security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w").Output()
-	if err != nil {
-		return "", errors.New("Keychain 中没有 agy 凭据（service gemini / account antigravity）")
-	}
-	raw := strings.TrimSpace(string(out))
-	raw = strings.TrimPrefix(raw, "go-keyring-base64:")
-	decoded, err := base64.StdEncoding.DecodeString(raw)
-	if err != nil {
-		if decoded, err = base64.RawStdEncoding.DecodeString(raw); err != nil {
-			return "", errors.New("无法解码 agy 凭据")
-		}
-	}
-	var stored struct {
-		Token struct {
-			AccessToken string    `json:"access_token"`
-			Expiry      time.Time `json:"expiry"`
-		} `json:"token"`
-	}
-	if err := json.Unmarshal(decoded, &stored); err != nil || stored.Token.AccessToken == "" {
-		return "", errors.New("无法解析 agy 凭据")
-	}
-	if time.Until(stored.Token.Expiry) <= time.Minute {
-		return "", errors.New("agy token 已过期；请先运行一次 agy 让它刷新凭据")
-	}
-	return stored.Token.AccessToken, nil
-}
-
-// modelVersionRe 匹配模型名中的第一个版本号（如 "Gemini 3.10 Flash" 的 3.10）。
-var modelVersionRe = regexp.MustCompile(`\d+(?:\.\d+)*`)
-
-// versionSegments 把名字中的第一个版本号按段拆成整数；没有版本号时返回 nil。
-func versionSegments(name string) []int {
-	parts := strings.Split(modelVersionRe.FindString(name), ".")
-	segs := make([]int, 0, len(parts))
-	for _, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return nil
-		}
-		segs = append(segs, n)
-	}
-	return segs
-}
-
-// compareVersions 按段比较版本号：3.10 > 3.9（ParseFloat 会把 3.10 当成 3.1）。
-// 前缀相同则段数多的更大；a 大返回正数，相等返回 0。
-func compareVersions(a, b []int) int {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return a[i] - b[i]
-		}
-	}
-	return len(a) - len(b)
-}
-
-func probeAntigravity(ctx context.Context) ServiceUsage {
-	s := ServiceUsage{Name: "Antigravity"}
-	token, err := antigravityToken()
-	if err != nil {
-		s.Err = err
-		return s
-	}
-	// 额度挂在每个模型上（quotaInfo.remainingFraction + resetTime）。
-	// 注意：不带 User-Agent / X-Goog-Api-Client 时这个端点一律回 429。
-	var resp struct {
-		Models map[string]struct {
-			DisplayName string `json:"displayName"`
-			QuotaInfo   *struct {
-				RemainingFraction float64 `json:"remainingFraction"`
-				ResetTime         string  `json:"resetTime"`
-			} `json:"quotaInfo"`
-		} `json:"models"`
-	}
-	err = postJSON(ctx, antigravityAPI+":fetchAvailableModels", map[string]string{
-		"Authorization":     "Bearer " + token,
-		"Content-Type":      "application/json",
-		"User-Agent":        "antigravity/1.1.11 darwin/arm64",
-		"X-Goog-Api-Client": "gl-go/1.24 antigravity/1.1.11",
-	}, "{}", &resp)
-	if err != nil {
-		s.Err = err
-		return s
-	}
-
-	// 同一模型的高中低推理档共享一族额度：按展示名去掉「(High)」等后缀聚合，
-	// 一族取最紧张（remainingFraction 最小）的那个模型来代表。
-	// 没有展示名的条目（多为尚未正式发布的新模型）用模型 id 去掉档级后缀兜底，
-	// 保证新模型一出现就能参与「最新模型」的竞选。
-	type family struct {
-		used    float64
-		resetAt time.Time
-	}
-	families := map[string]*family{}
-	for id, m := range resp.Models {
-		if m.QuotaInfo == nil {
-			continue
-		}
-		name := m.DisplayName
-		if i := strings.Index(name, " ("); i > 0 {
-			name = name[:i]
-		}
-		if name == "" {
-			name = strings.TrimSuffix(id, "-tiered")
-		}
-		used := (1 - m.QuotaInfo.RemainingFraction) * 100
-		f, ok := families[name]
-		if !ok {
-			families[name] = &family{used: used, resetAt: parseResetTime(m.QuotaInfo.ResetTime)}
-			continue
-		}
-		if used > f.used {
-			f.used = used
-			f.resetAt = parseResetTime(m.QuotaInfo.ResetTime)
-		}
-	}
-	if len(families) == 0 {
-		s.Err = errors.New("响应中没有 quotaInfo")
-		return s
-	}
-	// 只展示最新模型那一族，和其他厂商的单一额度口径保持一致。
-	// Antigravity 还代理 Claude 等别家模型，这里只取 Gemini 自家模型。
-	// 版本号按段比较（3.10 > 3.9），不能用 ParseFloat。
-	best := ""
-	var bestVer []int
-	for name, f := range families {
-		if !strings.Contains(strings.ToLower(name), "gemini") {
-			continue
-		}
-		v := versionSegments(name)
-		if v == nil {
-			continue
-		}
-		if best == "" || compareVersions(v, bestVer) > 0 ||
-			(compareVersions(v, bestVer) == 0 && f.used > families[best].used) {
-			best, bestVer = name, v
-		}
-	}
-	if best == "" { // 没有 Gemini 族就退而取任意一族
-		for name := range families {
-			best = name
-			break
-		}
-	}
-	f := families[best]
-	// 与其他厂商的口径统一：行标签是周期而非模型名。该额度的重置点实测
-	// 固定在约 5 小时周期的边界上；自动选出的最新模型族只用于取额度，
-	// 不展示具体模型名（Plan 留空）。
-	s.Windows = []Window{{Label: "5小时", UsedPercent: f.used, ResetAt: f.resetAt}}
-	return s
-}
-
-// auggieStatus 是 auggie account status --json 中面板所需的字段。
-// 其余字段（包括 banner）故意不解析，避免把账户信息带入结果。
-type auggieStatus struct {
-	PlanName               string `json:"planName"`
-	UsageUnit              string `json:"usageUnit"`
-	AmountRemaining        string `json:"amountRemaining"`
-	AmountIncludedPerCycle string `json:"amountIncludedPerCycle"`
-	BillingCycleEndDate    string `json:"billingCycleEndDate"`
-}
-
-func parseAuggieAmount(raw, field string) (float64, error) {
-	n, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
-		return 0, fmt.Errorf("Auggie %s 不是有效数字", field)
-	}
-	return n, nil
-}
-
-// parseAuggieWindow 解析 Auggie 的字符串额度并计算本周期窗口。
-// Used 保留原始绝对量（即使数据超出边界），只有百分比做 0–100 保护。
-func parseAuggieWindow(status auggieStatus) (Window, error) {
-	remaining, err := parseAuggieAmount(status.AmountRemaining, "amountRemaining")
-	if err != nil {
-		return Window{}, err
-	}
-	included, err := parseAuggieAmount(status.AmountIncludedPerCycle, "amountIncludedPerCycle")
-	if err != nil {
-		return Window{}, err
-	}
-	if included <= 0 {
-		return Window{}, errors.New("Auggie amountIncludedPerCycle 必须大于 0")
-	}
-	used := included - remaining
-	if math.IsInf(used, 0) || math.IsNaN(used) {
-		return Window{}, errors.New("Auggie 额度计算结果超出范围")
-	}
-	pct := used / included * 100
-	if pct < 0 {
-		pct = 0
-	} else if pct > 100 {
-		pct = 100
-	}
-	return Window{
-		Label:       "本周期",
-		UsedPercent: pct,
-		ResetAt:     parseResetTime(status.BillingCycleEndDate),
-		Used:        used,
-		Total:       included,
-	}, nil
-}
-
-func auggiePlan(planName, usageUnit string) string {
-	plan := strings.TrimSpace(planName)
-	unit := strings.TrimSpace(usageUnit)
-	if plan == "" {
-		return unit
-	}
-	if unit == "" || strings.Contains(strings.ToLower(plan), strings.ToLower(unit)) {
-		return plan
-	}
-	return plan + " · " + unit
-}
-
-func probeAuggie(ctx context.Context) ServiceUsage {
-	s := ServiceUsage{Name: "Auggie"}
-	if err := ctx.Err(); err != nil {
-		s.Err = err
-		return s
-	}
-	out, err := exec.CommandContext(ctx, "auggie", "account", "status", "--json").Output()
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			s.Err = ctxErr
-		} else {
-			s.Err = errors.New("Auggie CLI 不可用或执行失败")
-		}
-		return s
-	}
-	if err := ctx.Err(); err != nil {
-		s.Err = err
-		return s
-	}
-	var status auggieStatus
-	if err := json.Unmarshal(out, &status); err != nil {
-		s.Err = errors.New("无法解析 Auggie 状态 JSON")
-		return s
-	}
-	window, err := parseAuggieWindow(status)
-	if err != nil {
-		s.Err = err
-		return s
-	}
-	s.Plan = auggiePlan(status.PlanName, status.UsageUnit)
-	s.Windows = []Window{window}
-	return s
-}
-
 // ─── DeepSeek ─────────────────────────────────────────────────────────────
 
 // deepSeekBalanceFull 是按量余额换算百分比时的满额基准（元）。
@@ -1060,7 +798,7 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 func probeAll(ctx context.Context) []ServiceUsage {
 	probes := []func(context.Context) ServiceUsage{
 		probeClaude, probeCodex, probeGrok, probeKimi, probeGLM, probeMiniMax,
-		probeDeepSeek, probeAntigravity, probeAuggie,
+		probeDeepSeek,
 	}
 	results := make([]ServiceUsage, len(probes))
 	var wg sync.WaitGroup

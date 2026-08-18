@@ -27,8 +27,8 @@ var (
 const margin = 48
 
 type renderer struct {
-	img  *image.Gray
-	font *opentype.Font
+	img   *image.Gray
+	font  *opentype.Font
 	faces map[int]font.Face
 }
 

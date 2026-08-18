@@ -32,12 +32,12 @@ func TestGrokUsagePercent(t *testing.T) {
 
 func TestPrettyGrokTier(t *testing.T) {
 	cases := map[string]string{
-		"":                             "",
+		"":                                 "",
 		"SUBSCRIPTION_TIER_X_PREMIUM_PLUS": "X Premium+",
-		"X_PREMIUM_PLUS":               "X Premium+",
-		"SUPERGROK":                    "SuperGrok",
-		"SUPERGROK_HEAVY":              "SuperGrok Heavy",
-		"custom":                       "custom",
+		"X_PREMIUM_PLUS":                   "X Premium+",
+		"SUPERGROK":                        "SuperGrok",
+		"SUPERGROK_HEAVY":                  "SuperGrok Heavy",
+		"custom":                           "custom",
 	}
 	for in, want := range cases {
 		if got := prettyGrokTier(in); got != want {
