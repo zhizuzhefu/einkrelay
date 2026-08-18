@@ -758,7 +758,7 @@ func probeDeepSeek(ctx context.Context) ServiceUsage {
 }
 
 // periodRank 给窗口排层级：短周期在前。无法识别的标签按 0 处理
-// （同层不互相覆盖，例如 Antigravity 的模型族名）。
+// （同层之间不互相覆盖）。
 func periodRank(label string) int {
 	switch label {
 	case "本周":
