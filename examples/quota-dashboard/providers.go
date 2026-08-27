@@ -13,13 +13,18 @@
 //
 //	DeepSeek    环境变量 DEEPSEEK_API_KEY          → api.deepseek.com/user/balance
 //
+// 展示哪几家由 -providers / DASHBOARD_PROVIDERS 配置，默认全部；
+// 只有启用的来源才会被查询和展示，清单见 config.go。
+//
 // 用法：
 //
 //	DASHBOARD_FONT=/path/to/NotoSansCJKsc-Regular.otf \
 //	EINKRELAY_HOST=192.168.15.244:8080 EINKRELAY_TOKEN=... \
 //	go run .                # 查询七家额度 → 渲染 → 推送到 Kindle
 //
-//	go run . -o out.png     # 只渲染到本地文件，不推送
+//	go run . -o out.png                       # 只渲染到本地文件，不推送
+//	go run . -providers claude,codex,glm      # 只查这三家，按此顺序展示
+//	go run . -providers all,-grok             # 全部，但不查 Grok
 package main
 
 import (
@@ -795,18 +800,16 @@ func applyQuotaHierarchy(s *ServiceUsage) {
 
 // ─── 汇总 ─────────────────────────────────────────────────────────────────
 
-func probeAll(ctx context.Context) []ServiceUsage {
-	probes := []func(context.Context) ServiceUsage{
-		probeClaude, probeCodex, probeGrok, probeKimi, probeGLM, probeMiniMax,
-		probeDeepSeek,
-	}
-	results := make([]ServiceUsage, len(probes))
+// probeAll 并发查询已启用的来源（见 config.go），返回结果的顺序与
+// providers 一致——未启用的来源不查询，也不占面板位置。
+func probeAll(ctx context.Context, providers []provider) []ServiceUsage {
+	results := make([]ServiceUsage, len(providers))
 	var wg sync.WaitGroup
-	for i, p := range probes {
+	for i, p := range providers {
 		wg.Add(1)
-		go func(i int, p func(context.Context) ServiceUsage) {
+		go func(i int, p provider) {
 			defer wg.Done()
-			results[i] = p(ctx)
+			results[i] = p.Probe(ctx)
 		}(i, p)
 	}
 	wg.Wait()

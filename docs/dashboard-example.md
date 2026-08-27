@@ -28,6 +28,18 @@ go run . -format text -o out.md   # text 只写本地 Markdown
 
 Kimi、GLM、MiniMax、DeepSeek 走按量 API key，程序从环境变量 `KIMI_API_KEY`、`ZHIPUAI_API_KEY`（或 `GLM_API_KEY`）、`MINIMAX_API_KEY`、`DEEPSEEK_API_KEY` 读取；其余三家用本机 CLI 已登录的凭据，不需要额外配置。某一家查不到（未登录、未设 key、网络失败）时面板照常渲染，该服务显示「查询失败」一行，不影响其他家。
 
+### 选择展示哪几家
+
+默认查询并展示全部七家。只订了其中几家、或不想让某一家的「查询失败」长期占着一行时，用 `-providers` 配置启用清单——**没启用的来源不会被查询，也不会出现在面板上**（少查一家也少一次网络往返）：
+
+```sh
+go run . -providers claude,codex,glm   # 只要这三家，且按此顺序展示
+go run . -providers all,-grok          # 全部，但排除 Grok（!grok 同义）
+export DASHBOARD_PROVIDERS=claude,glm  # 同义的环境变量，适合后台常驻时写进启动脚本
+```
+
+可用 ID：`claude`、`codex`、`grok`、`kimi`、`glm`、`minimax`、`deepseek`（大小写不敏感），`all` 表示全部。留空等价于 `all`；配置里的顺序就是面板上的顺序；写了不认识的 ID 或一家都没启用时程序直接报错退出，不会静默推一块空面板。命令行 `-providers` 优先于 `DASHBOARD_PROVIDERS`。
+
 ### 快速测试显示功能（无需构建）
 
 仓库自带两个可直接推送的示例文件——[examples/dashboard.png](../examples/dashboard.png)（图片端点）和 [examples/dashboard.md](../examples/dashboard.md)（Markdown 端点，即 text 模式的真实产物）：

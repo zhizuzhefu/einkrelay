@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -13,10 +14,19 @@ func main() {
 	fontPath := flag.String("font", os.Getenv("DASHBOARD_FONT"), "CJK 字体文件路径（或用 DASHBOARD_FONT）；text 模式不需要")
 	format := flag.String("format", "image", "显示格式：image（主机渲染 PNG，推荐）或 text（设备端排版 Markdown）")
 	every := flag.Duration("every", 0, "每隔多久自动刷新一次（如 5m）；0 表示只跑一次")
+	providersSpec := flag.String("providers", os.Getenv("DASHBOARD_PROVIDERS"),
+		"启用哪些额度来源（或用 DASHBOARD_PROVIDERS）：逗号分隔的 "+
+			strings.Join(providerIDs(), "/")+"，顺序即展示顺序；"+
+			"默认 all（全部），all,-grok 表示全部但排除 Grok。只有启用的来源才会被查询和展示")
 	flag.Parse()
 
 	if *format != "image" && *format != "text" {
 		fmt.Fprintln(os.Stderr, "-format 只能是 image 或 text")
+		os.Exit(1)
+	}
+	providers, err := resolveProviders(*providersSpec)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	var fontData []byte
@@ -25,7 +35,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, "需要 CJK 字体：设置 DASHBOARD_FONT 或 -font（固定字体见 assets/fonts/manifest.json 的 URL）")
 			os.Exit(1)
 		}
-		var err error
 		fontData, err = os.ReadFile(*fontPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "读取字体失败:", err)
@@ -56,7 +65,7 @@ func main() {
 	}
 
 	for {
-		err := runOnce(fontData, width, height, *out, *format, host, token)
+		err := runOnce(providers, fontData, width, height, *out, *format, host, token)
 		if *every <= 0 {
 			if err != nil {
 				os.Exit(1)
@@ -72,12 +81,12 @@ func main() {
 	}
 }
 
-func runOnce(fontData []byte, width, height int, out, format, host, token string) error {
+func runOnce(providers []provider, fontData []byte, width, height int, out, format, host, token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	start := time.Now()
-	services := probeAll(ctx)
+	services := probeAll(ctx, providers)
 	fmt.Fprintf(os.Stderr, "额度查询完成，耗时 %s\n", time.Since(start).Round(time.Millisecond))
 	for _, s := range services {
 		if s.Err != nil {
